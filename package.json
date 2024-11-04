@@ -1,0 +1,23 @@
+{
+  "name": "twilio_assemblyai",
+  "version": "1.0.0",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "assemblyai": "^4.7.0",
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "ws": "^7.5.10"
+  },
+  "keywords": [],
+  "description": "",
+  "devDependencies": {
+    "@types/vscode": "^1.92.0"
+  }
+}
