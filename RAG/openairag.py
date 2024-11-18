@@ -50,15 +50,19 @@ def retrieve_entries(query, index, data, vectorizer, k=5):
 def chat_gpt(query, retrieved_texts):
     context = "\n".join(retrieved_texts)
     prompt = f"Context:\n{context}\n\nGiven the partial transcript: '{query}', predict what the speaker is most likely saying."
+    print("Prompt for OpenAI:", prompt)  
     
-    response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=150,
-        temperature=0.7
-    )
-    
-    return response.choices[0]['message']['content'].strip()
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=150,
+            temperature=0.7
+        )
+        return response.choices[0].message['content'].strip() 
+    except Exception as e:
+        print("Error in OpenAI API call:", e)  
+        raise
 
 # Load your CSV data (Make sure the file path is correct)
 csv_file = 'emergency.csv'  # Example CSV file with text data

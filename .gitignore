@@ -1,3 +1,4 @@
 .env
 emergencyenv/
 venv/
+.DS_Store
