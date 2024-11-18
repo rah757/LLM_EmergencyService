@@ -2,3 +2,5 @@
 emergencyenv/
 venv/
 .DS_Store
+node_modules/
+RAG/__pycache__/
