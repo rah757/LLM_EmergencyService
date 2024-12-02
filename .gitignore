@@ -1,7 +1,12 @@
 .env
 emergencyenv/
 venv/
+
 .DS_Store
+
 node_modules/
-RAG/__pycache__/
+
+**/__pycache__/
+*.py[cod]
+
 speechapi.json
