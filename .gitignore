@@ -1,12 +1,16 @@
-.env
+node_modules/
+*.log
+
 emergencyenv/
 venv/
 
 .DS_Store
 
-node_modules/
+__pycache__/
+*.pyc
 
-**/__pycache__/
-*.py[cod]
-
+.env
 speechapi.json
+
+.RAG/__pycache__/
+RAG/__pycache__/
