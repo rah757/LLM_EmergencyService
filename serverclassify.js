@@ -1,20 +1,22 @@
 import express from 'express';
 import pkg from 'ws';
 import { SpeechClient } from '@google-cloud/speech';
+import { TranslationServiceClient } from '@google-cloud/translate';
 import axios from 'axios';
 import dotenv from 'dotenv';
 import fs from 'fs';
 
-// Load environment variables
 dotenv.config();
 
-// Explicitly set the Google credentials path
 process.env.GOOGLE_APPLICATION_CREDENTIALS = process.env.GOOGLE_APPLICATION_CREDENTIALS;
 
 console.log('GOOGLE_APPLICATION_CREDENTIALS:', process.env.GOOGLE_APPLICATION_CREDENTIALS);
 
 // Initialize Google Cloud Speech Client
 const speechClient = new SpeechClient();
+
+// Initialize Google Cloud Translation Client
+const translateClient = new TranslationServiceClient();
 
 // Set up Express server
 const app = express();
@@ -56,10 +58,10 @@ wss.on('connection', (webSocket) => {
   // Configuration for Google Cloud Speech API
   const request = {
     config: {
-      encoding: 'MULAW',
+      encoding: 'MULAW', 
       sampleRateHertz: 8000, 
-      languageCode: 'hi-IN',
-      alternativeLanguageCodes: ['en-US', 'ml-IN'], // List of alternative language codes
+      languageCode: 'ml-IN', 
+      alternativeLanguageCodes: ['en-US', 'hi-IN'], 
     },
     interimResults: true, 
   };
@@ -74,12 +76,22 @@ wss.on('connection', (webSocket) => {
       if (result.isFinal) {
         console.log('Final Transcription:', result.alternatives[0].transcript);
         try {
-          // Send the final transcript to the Python Flask API for RAG and classification
+          // Translate the final transcript to English
+          const [translation] = await translateClient.translateText({
+            parent: `projects/${process.env.GOOGLE_PROJECT_ID}/locations/global`,
+            contents: [result.alternatives[0].transcript],
+            mimeType: 'text/plain',
+            sourceLanguageCode: result.languageCode,
+            targetLanguageCode: 'en',
+          });
+          const translatedText = translation.translations[0].translatedText;
+          console.log('Translated Text:', translatedText);
+
+          // Send the translated transcript to the Python Flask API for RAG and classification
           const response = await axios.post('http://localhost:5001/generate', {
-            transcript: result.alternatives[0].transcript  // Sending the final transcript as payload
+            transcript: translatedText  // Sending the translated transcript as payload
           });
           
-          // Log the response from the RAG model and severity classification
           console.log('Response from RAG:', response.data.response);
           console.log('Severity Classification:', response.data.severity);
         } catch (error) {
