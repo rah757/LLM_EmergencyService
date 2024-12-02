@@ -1,19 +1,30 @@
-import { createServer } from 'http';
 import express from 'express';
 import pkg from 'ws';
-import 'dotenv/config';
-import * as assemblyai from 'assemblyai'; // Import the default export
-import axios from 'axios'; // Import axios for making HTTP requests to Flask
+import { SpeechClient } from '@google-cloud/speech';
+import axios from 'axios';
+import dotenv from 'dotenv';
+import fs from 'fs';
 
-const { RealtimeTranscriber } = assemblyai; // Destructure RealtimeTranscriber from the imported module
-const { Server: WebSocketServer } = pkg;
+// Load environment variables
+dotenv.config();
 
+// Explicitly set the Google credentials path
+process.env.GOOGLE_APPLICATION_CREDENTIALS = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+
+console.log('GOOGLE_APPLICATION_CREDENTIALS:', process.env.GOOGLE_APPLICATION_CREDENTIALS);
+
+// Initialize Google Cloud Speech Client
+const speechClient = new SpeechClient();
+
+// Set up Express server
 const app = express();
-const server = createServer(app);
+const PORT = 3000;
 
-app.get('/', (_, res) => res.type('text').send('Twilio media stream transcriber'));
+app.get('/', (req, res) => {
+  res.send('Twilio media stream transcriber');
+});
 
-app.post('/', async (req, res) => {
+app.post('/', (req, res) => {
   res.type('xml').send(
     `<Response>
         <Say>
@@ -28,53 +39,71 @@ app.post('/', async (req, res) => {
 
 console.log('Listening on port 3000');
 
-const wss = new WebSocketServer({ server });
+// Start HTTP server
+const server = app.listen(PORT, () => {
+  console.log(`Server started on port ${PORT}`);
+});
 
-wss.on('connection', async (ws) => {
+// Set up WebSocket server
+const { Server } = pkg;
+const wss = new Server({ server });
+
+wss.on('connection', (webSocket) => {
   console.log('Twilio media stream WebSocket connected');
 
-  const transcriber = new RealtimeTranscriber({
-    apiKey: process.env.ASSEMBLYAI_API_KEY, // Your AssemblyAI API key
-    encoding: "pcm_mulaw", // Set encoding to match Twilio's output
-    sampleRate: 8000, // Set the sample rate to match Twilio's output
-  });
+  let speechStream;
 
-  transcriber.on("open", ({ sessionId, expiresAt }) => {
-    console.log('Session ID:', sessionId, 'Expires at:', expiresAt);
-  });
+  // Configuration for Google Cloud Speech API
+  const request = {
+    config: {
+      encoding: 'MULAW',
+      sampleRateHertz: 8000, 
+      languageCode: 'hi-IN',
+      alternativeLanguageCodes: ['en-US', 'ml-IN'], // List of alternative language codes
+    },
+    interimResults: true, 
+  };
 
-  transcriber.on("close", (code, reason) => {
-    console.log('Closed', code, reason);
-  });
+  // Initialize the Google Speech Stream
+  speechStream = speechClient.streamingRecognize(request);
 
-  transcriber.on("transcript.partial", (transcript) => {
-    console.log('Partial transcript:', transcript.text);
-  });
-
-  transcriber.on("transcript.final", async (transcript) => {
-    console.log('Final transcript:', transcript.text);
-
-    try {
-      // Send the final transcript to the Python Flask API for RAG and classification
-      const response = await axios.post('http://localhost:5001/generate', {
-        transcript: transcript.text  // Sending the final transcript as payload
-      });
-      
-      // Log the response from the RAG model and severity classification
-      console.log('Response from RAG:', response.data.response);
-      console.log('Severity Classification:', response.data.severity);
-    } catch (error) {
-      console.error('Error sending transcript to RAG:', error);
+  // Handle responses from Google Speech API
+  speechStream.on('data', async (data) => {
+    if (data.results && data.results.length > 0) {
+      const result = data.results[0];
+      if (result.isFinal) {
+        console.log('Final Transcription:', result.alternatives[0].transcript);
+        try {
+          // Send the final transcript to the Python Flask API for RAG and classification
+          const response = await axios.post('http://localhost:5001/generate', {
+            transcript: result.alternatives[0].transcript  // Sending the final transcript as payload
+          });
+          
+          // Log the response from the RAG model and severity classification
+          console.log('Response from RAG:', response.data.response);
+          console.log('Severity Classification:', response.data.severity);
+        } catch (error) {
+          console.error('Error sending transcript to RAG:', error);
+        }
+      } else {
+        console.log('Interim Transcription:', result.alternatives[0].transcript);
+      }
+    } else {
+      console.log('No transcription result received');
     }
   });
 
-  transcriber.on("error", (error) => {
-    console.error('Error', error);
+  speechStream.on('error', (err) => {
+    console.error('Google Speech API Stream Error:', err);
+    speechStream.end();
   });
 
-  await transcriber.connect();
+  speechStream.on('end', () => {
+    console.log('Google Speech API Stream ended');
+  });
 
-  ws.on('message', async (message) => {
+  // Handle incoming WebSocket messages
+  webSocket.on('message', (message) => {
     const msg = JSON.parse(message);
     switch (msg.event) {
       case 'connected':
@@ -85,7 +114,13 @@ wss.on('connection', async (ws) => {
         break;
       case 'media':
         const audioChunk = Buffer.from(msg.media.payload, 'base64');
-        transcriber.sendAudio(audioChunk);  // Send the audio chunk to AssemblyAI
+        if (speechStream && !speechStream.destroyed) {
+          try {
+            speechStream.write(audioChunk);
+          } catch (error) {
+            console.error('Error writing to Google Speech API Stream:', error);
+          }
+        }
         break;
       case 'stop':
         console.info('Twilio media stream stopped');
@@ -93,10 +128,11 @@ wss.on('connection', async (ws) => {
     }
   });
 
-  ws.on('close', async () => {
+  // Handle WebSocket close event
+  webSocket.on('close', () => {
+    if (speechStream) {
+      speechStream.end();
+    }
     console.log('Twilio media stream WebSocket disconnected');
-    await transcriber.close();  // Close the AssemblyAI real-time transcriber connection
   });
 });
-
-server.listen(3000);

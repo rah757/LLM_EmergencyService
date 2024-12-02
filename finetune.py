@@ -51,7 +51,7 @@ def fine_tune_rag(train_file):
         args=training_args,
         train_dataset=tokenized_datasets,  # Use the processed dataset
         tokenizer=tokenizer.generator,  # Use BART's generator tokenizer
-    )
+    )~
 
     # Start fine-tuning
     trainer.train()
