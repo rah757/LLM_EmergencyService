@@ -1,4 +1,4 @@
-# Emergency Communication System - ReadMe
+# LLM-based Real-Time Speech Reconstruction and Call Prioritization for Emergency Services
 
 ## Overview
 
