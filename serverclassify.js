@@ -4,7 +4,6 @@ import { SpeechClient } from '@google-cloud/speech';
 import { TranslationServiceClient } from '@google-cloud/translate';
 import axios from 'axios';
 import dotenv from 'dotenv';
-import fs from 'fs';
 
 dotenv.config();
 
@@ -55,15 +54,14 @@ wss.on('connection', (webSocket) => {
 
   let speechStream;
 
-  // Configuration for Google Cloud Speech API
   const request = {
     config: {
-      encoding: 'MULAW', 
-      sampleRateHertz: 8000, 
-      languageCode: 'ml-IN', 
-      alternativeLanguageCodes: ['en-US', 'hi-IN'], 
+      encoding: 'MULAW',
+      sampleRateHertz: 8000,
+      languageCode: 'en-US', // English by default
+      alternativeLanguageCodes: ['hi-IN', 'es-ES'], // Fallback onto Hindi or Spanish, can change as required
     },
-    interimResults: true, 
+    interimResults: true,
   };
 
   // Initialize the Google Speech Stream
@@ -73,29 +71,48 @@ wss.on('connection', (webSocket) => {
   speechStream.on('data', async (data) => {
     if (data.results && data.results.length > 0) {
       const result = data.results[0];
+
+      // Log the detected language 
+      // console.log('Detected Language:', result.languageCode);
+
       if (result.isFinal) {
         console.log('Final Transcription:', result.alternatives[0].transcript);
-        try {
-          // Translate the final transcript to English
-          const [translation] = await translateClient.translateText({
-            parent: `projects/${process.env.GOOGLE_PROJECT_ID}/locations/global`,
-            contents: [result.alternatives[0].transcript],
-            mimeType: 'text/plain',
-            sourceLanguageCode: result.languageCode,
-            targetLanguageCode: 'en',
-          });
-          const translatedText = translation.translations[0].translatedText;
-          console.log('Translated Text:', translatedText);
 
-          // Send the translated transcript to the Python Flask API for RAG and classification
+        // If the detected language is the same as English, skip translation
+        if (result.languageCode !== 'en-us') {
+          try {
+            // Only translate if the source language is not English
+            const [translation] = await translateClient.translateText({
+              parent: `projects/${process.env.GOOGLE_PROJECT_ID}/locations/global`,
+              contents: [result.alternatives[0].transcript],
+              mimeType: 'text/plain',
+              sourceLanguageCode: result.languageCode,
+              targetLanguageCode: 'en',
+            });
+            const translatedText = translation.translations[0].translatedText;
+            console.log('Translated Text:', translatedText);
+
+            // Send the translated transcript to the Python Flask API for RAG and classification
+            const response = await axios.post('http://localhost:5001/generate', {
+              transcript: translatedText,  // Sending the translated transcript as payload
+            });
+
+            console.log('Response from RAG:', response.data.response);
+            console.log('Severity Classification:', response.data.severity);
+          } catch (error) {
+            console.error('Error sending transcript to RAG:', error);
+          }
+        } else {
+          // If the language is already English, no need to translate
+          // console.log('No translation needed, transcript is already in English:');
+
+          // Send the original transcript to the Python Flask API for RAG and classification
           const response = await axios.post('http://localhost:5001/generate', {
-            transcript: translatedText  // Sending the translated transcript as payload
+            transcript: result.alternatives[0].transcript,  // Sending the original transcript as payload
           });
-          
+
           console.log('Response from RAG:', response.data.response);
           console.log('Severity Classification:', response.data.severity);
-        } catch (error) {
-          console.error('Error sending transcript to RAG:', error);
         }
       } else {
         console.log('Interim Transcription:', result.alternatives[0].transcript);
@@ -128,7 +145,7 @@ wss.on('connection', (webSocket) => {
         const audioChunk = Buffer.from(msg.media.payload, 'base64');
         if (speechStream && !speechStream.destroyed) {
           try {
-            speechStream.write(audioChunk);
+            speechStream.write(audioChunk); // Continuously write audio data to the stream
           } catch (error) {
             console.error('Error writing to Google Speech API Stream:', error);
           }
