@@ -1,33 +1,34 @@
 import express from 'express';
 import pkg from 'ws';
+const { Server } = pkg;
 import { SpeechClient } from '@google-cloud/speech';
 import { TranslationServiceClient } from '@google-cloud/translate';
 import { TextToSpeechClient } from '@google-cloud/text-to-speech';
 import axios from 'axios';
 import dotenv from 'dotenv';
-import record from 'node-record-lpcm16';
+import { spawn } from 'child_process';
+import { v4 as uuidv4 } from 'uuid';
+import { PassThrough } from 'stream';
+import fs from 'fs';
 
 dotenv.config();
 
 process.env.GOOGLE_APPLICATION_CREDENTIALS = process.env.GOOGLE_APPLICATION_CREDENTIALS;
 console.log('GOOGLE_APPLICATION_CREDENTIALS:', process.env.GOOGLE_APPLICATION_CREDENTIALS);
 
-// Initialize Google Cloud Speech Client
+// Initialize clients
 const speechClient = new SpeechClient();
-
-// Initialize Google Cloud Translation Client
 const translateClient = new TranslationServiceClient();
-
 const ttsClient = new TextToSpeechClient();
 
-// to ensure dispatcher terminal gets launched only once
+// Global state
 let isDispatcherTerminalLaunched = false;
-// to detect caller language and further send to the dispatcher terminal
 let detectedCallerLanguage = null;
-
-// Track active call information
 let activeCallSid = null;
 let activeWebSocket = null;
+let streamSid = null;
+let currentSoxProcess = null;
+let stdinEnded = false;
 
 // Set up Express server
 const app = express();
@@ -36,6 +37,7 @@ const PORT = 3000;
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Basic endpoints
 app.get('/', (req, res) => {
   res.send('Twilio media stream transcriber');
 });
@@ -43,87 +45,118 @@ app.get('/', (req, res) => {
 app.post('/', (req, res) => {
   res.type('xml').send(
     `<Response>
-        <Say>
-          Speak to see your audio transcribed in the console.
-        </Say>
+        <Say>Connection established.</Say>
         <Connect>
           <Stream url='wss://${req.headers.host}' />
         </Connect>
-      </Response>`
+     </Response>`
   );
 });
 
-// add dispatcher response
+
 app.post('/dispatcher-response', async (req, res) => {
   console.log('Received dispatcher response:', req.body);
-  
-  if (!req.body || !req.body.text) {
+
+  if (!req.body?.text) {
     console.error('Invalid request body received');
     return res.status(400).json({ error: 'Invalid request body' });
   }
 
-  const { text, language, callSid } = req.body;
+  const { text, language } = req.body;
   console.log('\n--- Processing Dispatcher Response ---');
   console.log('Received text:', text);
   console.log('Language:', language);
-  console.log('Call SID:', callSid);
 
   try {
-    // Convert to speech
+    // Step 1: Convert text to speech
+    console.log('Starting text-to-speech conversion...');
     const [ttsResponse] = await ttsClient.synthesizeSpeech({
       input: { text },
       voice: { languageCode: language, ssmlGender: 'NEUTRAL' },
-      audioConfig: { audioEncoding: 'MP3' },
+      audioConfig: { audioEncoding: 'LINEAR16', sampleRateHertz: 16000 },
     });
-    
-    console.log('Text-to-Speech conversion completed');
+    console.log('Text-to-speech conversion completed');
+    const ttsBuffer = Buffer.from(ttsResponse.audioContent);
+    console.log(`Total TTS buffer size: ${ttsBuffer.length} bytes`);
 
-    // Send audio response through the active WebSocket connection
-    if (activeWebSocket) {
-      activeWebSocket.send(JSON.stringify({
-        event: 'dispatcher_audio',
-        audio: ttsResponse.audioContent.toString('base64')
-      }));
-      console.log('Audio sent through WebSocket');
-    } else {
-      console.log('No active WebSocket connection found');
-    }
+    // Step 2: Generate unique filenames
+    const uniqueId = uuidv4(); // Generate a unique identifier
+    const inputFilePath = `./input_${uniqueId}.raw`;
+    const outputFilePath = `./output_${uniqueId}.wav`;
 
-    res.json({ success: true, message: 'Audio processed successfully' });
-    console.log('Response sent successfully');
-    console.log('-----------------------------------\n');
+    // Step 3: Write TTS buffer to a file
+    fs.writeFileSync(inputFilePath, ttsBuffer);
+    console.log(`TTS buffer written to ${inputFilePath}`);
 
+    // Step 4: Start SoX process
+    console.log('Starting SoX process...');
+    const soxProcess = spawn('sox', [
+      '-t', 'raw', '-r', '16000', '-e', 'signed-integer', '-b', '16', '-c', '1', inputFilePath, // Input
+      '-t', 'wav', '-r', '8000', '-e', 'u-law', '-b', '8', '-c', '1', '-' // Output as raw stream
+    ]);
+
+    // Handle SoX stdout: Send audio chunks to Twilio WebSocket
+    soxProcess.stdout.on('data', (chunk) => {
+      if (activeWebSocket && activeWebSocket.readyState === activeWebSocket.OPEN) {
+        const payload = chunk.toString('base64'); // Convert audio chunk to base64
+        const mediaMessage = {
+          event: 'media',
+          streamSid, // Ensure streamSid is correctly set
+          media: { payload },
+        };
+        // console.log('Sending media message to Twilio:', JSON.stringify(mediaMessage));
+        activeWebSocket.send(JSON.stringify(mediaMessage), (err) => {
+          if (err) {
+            console.error('WebSocket send error:', err);
+          } else {
+            console.log('Media message sent successfully.');
+          }
+        });
+      } else {
+        console.warn('WebSocket not open. Skipping chunk processing.');
+      }
+    });
+
+    // Handle SoX process close
+    soxProcess.on('close', (code) => {
+      if (code === 0) {
+        console.log('Audio processing completed successfully.');
+      } else {
+        console.error(`SoX process exited with code ${code}`);
+      }
+
+      // Cleanup temporary files
+      if (fs.existsSync(inputFilePath)) {
+        fs.unlinkSync(inputFilePath);
+      }
+    });
+
+    // Handle SoX errors
+    soxProcess.stderr.on('data', (data) => {
+      console.error('SoX stderr:', data.toString());
+    });
+
+    soxProcess.stdin.on('error', (error) => {
+      console.error('SoX stdin error:', error.message);
+    });
+
+    res.json({ success: true, message: 'Audio is being streamed to Twilio.' });
   } catch (error) {
     console.error('Error processing dispatcher response:', error);
-    console.log('Error details:', error.message);
-    console.log('-----------------------------------\n');
-    res.status(500).json({ 
-      error: 'Failed to process dispatcher response',
-      details: error.message 
-    });
+    res.status(500).json({ error: 'Failed to process response' });
   }
 });
 
-console.log('Listening on port 3000');
-
-// Start HTTP server
-const server = app.listen(PORT, () => {
-  console.log(`Server started on port ${PORT}`);
-});
-
+  
 // Set up WebSocket server
-const { Server } = pkg;
+const server = app.listen(PORT, () => console.log(`Server started on port ${PORT}`));
 const wss = new Server({ server });
 
 wss.on('connection', (webSocket) => {
   console.log('Twilio media stream WebSocket connected');
-  
-  // Store the active WebSocket connection
   activeWebSocket = webSocket;
 
-  let speechStream;
-
-  const request = {
+  let speechStream = speechClient.streamingRecognize({
     config: {
       encoding: 'MULAW',
       sampleRateHertz: 8000,
@@ -133,140 +166,143 @@ wss.on('connection', (webSocket) => {
       alternativeLanguageCodes: ['hi-IN', 'es-ES', 'fr-FR', 'de-DE'],
     },
     interimResults: true,
-  };
+  });
 
-  // Initialize the Google Speech Stream
-  speechStream = speechClient.streamingRecognize(request);
-
-  // Handle responses from Google Speech API
+  // Handle speech recognition
   speechStream.on('data', async (data) => {
-    if (data.results && data.results.length > 0) {
+    if (data.results?.[0]?.isFinal) {
       const result = data.results[0];
-      
-      if (result.isFinal) {
-        console.log('Speech recognition language:', result.languageCode);
-        console.log('Final Transcription:', result.alternatives[0].transcript);
+      const transcript = result.alternatives[0]?.transcript?.trim();
+      console.log('Speech recognition language:', result.languageCode);
+      console.log('Final Transcription:', transcript);
 
-        // Store the detected language and launch dispatcher terminal only once
-        if (!isDispatcherTerminalLaunched) {
-          detectedCallerLanguage = result.languageCode;
-          try {
-            const { spawn } = await import('child_process');
-            console.log('Starting dispatcher terminal...');
-            console.log(`Caller's detected language: ${detectedCallerLanguage}`);
-            
-            // Get the current directory path
-            const currentDir = process.cwd();
+      if (!transcript) {
+        console.warn('Empty transcription received, skipping processing.');
+        return;
+      }
 
-            // spawn the terminal with specific commands and pass Call SID
-            const terminal = spawn('osascript', [
-              '-e', 
-              `tell app "Terminal" to do script "cd '${currentDir}' && source emergencyenv/bin/activate && CALLER_LANGUAGE=${detectedCallerLanguage} CALL_SID=${activeCallSid} node dispatcher.js"`
-            ]);
+      // Launch dispatcher if first message
+      if (!isDispatcherTerminalLaunched) {
+        detectedCallerLanguage = result.languageCode;
+        try {
+          const { spawn } = await import('child_process');
+          console.log('Starting dispatcher terminal...');
+          console.log(`Caller's language: ${detectedCallerLanguage}`);
 
-            isDispatcherTerminalLaunched = true;
-            console.log('Dispatcher terminal launched successfully');
+          const currentDir = process.cwd();
+          const terminal = spawn('osascript', [
+            '-e',
+            `tell app "Terminal" to do script "cd '${currentDir}' && source emergencyenv/bin/activate && CALLER_LANGUAGE=${detectedCallerLanguage} CALL_SID=${activeCallSid} node tdispatcher.js"`
+          ]);
 
-            terminal.on('error', (err) => {
-              console.error('Failed to start dispatcher terminal:', err);
-            });
+          isDispatcherTerminalLaunched = true;
+          console.log('Dispatcher terminal launched successfully');
 
-          } catch (error) {
-            console.error('Error launching dispatcher terminal:', error);
-          }
+          terminal.on('error', (err) => {
+            console.error('Failed to start dispatcher terminal:', err);
+          });
+        } catch (error) {
+          console.error('Error launching dispatcher terminal:', error);
         }
+      }
 
-        // Handle translation and RAG processing
-        if (result.languageCode !== 'en-us') {
+      // Handle translation and RAG
+      if (result.languageCode !== 'en-us') {
+        try {
+          console.log('Translating transcript...');
+          const [translation] = await translateClient.translateText({
+            parent: `projects/${process.env.GOOGLE_PROJECT_ID}/locations/global`,
+            contents: [transcript],
+            mimeType: 'text/plain',
+            sourceLanguageCode: result.languageCode,
+            targetLanguageCode: 'en',
+          });
+
+          const translatedText = translation.translations[0]?.translatedText;
+          console.log('Translated Text:', translatedText);
+
           try {
-            // Translate non-English speech to English
-            const [translation] = await translateClient.translateText({
-              parent: `projects/${process.env.GOOGLE_PROJECT_ID}/locations/global`,
-              contents: [result.alternatives[0].transcript],
-              mimeType: 'text/plain',
-              sourceLanguageCode: result.languageCode,
-              targetLanguageCode: 'en',
-            });
-            const translatedText = translation.translations[0].translatedText;
-            console.log('Translated Text:', translatedText);
-
-            // Process with RAG system
+            console.log('Sending transcript to RAG service...');
             const response = await axios.post('http://localhost:5001/generate', {
               transcript: translatedText,
             });
-            console.log('Response from RAG:', response.data.response);
-            console.log('Severity Classification:', response.data.severity);
-
+            console.log('RAG Response:', response.data.response);
+            console.log('Severity:', response.data.severity);
           } catch (error) {
-            console.error('Error in translation or RAG processing:', error);
+            console.log('RAG service not available - continuing without RAG processing');
           }
-        } else {
-          // Process English speech directly
-          try {
-            const response = await axios.post('http://localhost:5001/generate', {
-              transcript: result.alternatives[0].transcript,
-            });
-            console.log('Response from RAG:', response.data.response);
-            console.log('Severity Classification:', response.data.severity);
-          } catch (error) {
-            console.error('Error in RAG processing:', error);
-          }
+        } catch (error) {
+          console.error('Translation error:', error);
         }
       } else {
-        // Handle interim results
-        console.log('Interim Transcription:', result.alternatives[0].transcript);
+        try {
+          console.log('Sending transcript to RAG service...');
+          const response = await axios.post('http://localhost:5001/generate', {
+            transcript: transcript,
+          });
+          console.log('RAG Response:', response.data.response);
+          console.log('Severity:', response.data.severity);
+        } catch (error) {
+          console.log('RAG service not available - continuing without RAG processing');
+        }
       }
-    } else {
-      console.log('No transcription result received');
     }
-  });
-
-  speechStream.on('error', (err) => {
-    console.error('Google Speech API Stream Error:', err);
-    speechStream.end();
-  });
-
-  speechStream.on('end', () => {
-    console.log('Google Speech API Stream ended');
   });
 
   // Handle incoming WebSocket messages
   webSocket.on('message', (message) => {
+    // console.log('Received WebSocket message:', message);
     const msg = JSON.parse(message);
     switch (msg.event) {
       case 'connected':
-        activeCallSid = msg.streamSid;  // Store the Call SID
-        console.info('Twilio media stream connected');
-        console.info('Call SID:', activeCallSid);
+        console.info('Twilio stream connected');
         break;
       case 'start':
-        console.info('Twilio media stream started');
+        streamSid = msg.start.streamSid;
+        activeCallSid = msg.start.callSid;
+        console.info('Stream started. CallSid:', activeCallSid);
         break;
       case 'media':
-        const audioChunk = Buffer.from(msg.media.payload, 'base64');
         if (speechStream && !speechStream.destroyed) {
           try {
-            speechStream.write(audioChunk);
+            // console.log('Received media message, writing to speech stream...');
+            speechStream.write(Buffer.from(msg.media.payload, 'base64'));
           } catch (error) {
-            console.error('Error writing to Google Speech API Stream:', error);
+            console.error('Error processing audio:', error);
           }
+        } else {
+          console.warn('Speech stream not available, skipping media message');
         }
         break;
       case 'stop':
-        console.info('Twilio media stream stopped');
+        console.info('Twilio stream stopped');
         break;
     }
   });
 
-  // Handle WebSocket close event
-  webSocket.on('close', () => {
-    if (speechStream) {
-      speechStream.end();
-    }
-    if (activeWebSocket === webSocket) {
-      activeWebSocket = null;
-      activeCallSid = null;
-    }
-    console.log('Twilio media stream WebSocket disconnected');
+  // Handle WebSocket closure
+  webSocket.on('close', (code, reason) => {
+    console.log(`WebSocket connection closed by Twilio with code ${code} and reason: ${reason}`);
+    if (speechStream) speechStream.end();
+    console.log('WebSocket disconnected');
   });
+
+  // Handle WebSocket errors
+  webSocket.on('error', (error) => {
+    console.error('WebSocket error:', error);
+  });
+});
+
+// Handle WebSocket server errors
+wss.on('error', (error) => {
+  console.error('WebSocket server error:', error);
+});
+
+// Cleanup on process exit
+process.on('SIGINT', () => {
+  console.log('Received SIGINT, cleaning up...');
+  if (currentSoxProcess) {
+    currentSoxProcess.kill();
+  }
+  process.exit(0);
 });
